@@ -162,7 +162,7 @@ impl<H: Handler> Handler for DeflateHandler<H> {
     }
 
     fn on_request(&mut self, req: &Request) -> Result<Response> {
-        let mut res = try!(Response::from_request(req));
+        let mut res = try!(self.inner.on_request(req));
 
         'ext: for req_ext in try!(req.extensions())
             .iter()
@@ -400,7 +400,7 @@ impl<H: Handler> Handler for DeflateHandler<H> {
             self.pass = true
         }
 
-        Ok(())
+        self.inner.on_response(res)
     }
 
     fn on_frame(&mut self, mut frame: Frame) -> Result<Option<Frame>> {
