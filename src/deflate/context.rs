@@ -62,7 +62,7 @@ pub struct Compressor {
 }
 
 impl Compressor {
-    pub fn new(window_bits: i8) -> Compressor {
+    pub fn new(window_bits: i8, compression_level: i32) -> Compressor {
         debug_assert!(window_bits >= 9, "Received too small window size.");
         debug_assert!(window_bits <= 15, "Received too large window size.");
 
@@ -70,7 +70,7 @@ impl Compressor {
             let mut stream: Box<ffi::z_stream> = Box::new(mem::zeroed());
             let result = ffi::deflateInit2_(
                 stream.as_mut(),
-                9,
+                compression_level,
                 ffi::Z_DEFLATED,
                 -window_bits as c_int,
                 9,

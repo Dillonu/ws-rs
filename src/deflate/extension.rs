@@ -41,6 +41,9 @@ pub struct DeflateSettings {
     /// exceeded. If this is not true, a capacity error will be triggered instead.
     /// Default: true
     pub fragments_grow: bool,
+    /// The compression level (between 1-9)
+    /// Default: 9 (Best)
+    pub compression_level: u8
 }
 
 impl Default for DeflateSettings {
@@ -51,6 +54,7 @@ impl Default for DeflateSettings {
             accept_no_context_takeover: true,
             fragments_capacity: 10,
             fragments_grow: true,
+            compression_level: 1
         }
     }
 }
@@ -79,7 +83,7 @@ impl DeflateBuilder {
     /// Wrap another handler in with a deflate handler as configured.
     pub fn build<H: Handler>(&self, handler: H) -> DeflateHandler<H> {
         DeflateHandler {
-            com: Compressor::new(self.settings.max_window_bits as i8),
+            com: Compressor::new(self.settings.max_window_bits as i8, self.settings.compression_level as i32),
             dec: Decompressor::new(self.settings.max_window_bits as i8),
             fragments: Vec::with_capacity(self.settings.fragments_capacity),
             compress_reset: false,
@@ -114,7 +118,7 @@ impl<H: Handler> DeflateHandler<H> {
         trace!("Using permessage-deflate handler.");
         let settings = DeflateSettings::default();
         DeflateHandler {
-            com: Compressor::new(settings.max_window_bits as i8),
+            com: Compressor::new(settings.max_window_bits as i8, settings.compression_level as i32),
             dec: Decompressor::new(settings.max_window_bits as i8),
             fragments: Vec::with_capacity(settings.fragments_capacity),
             compress_reset: false,
@@ -204,7 +208,7 @@ impl<H: Handler> Handler for DeflateHandler<H> {
                                 if let Ok(window_bits) = window_bits_str.trim().parse() {
                                     if window_bits >= 9 && window_bits <= 15 {
                                         if window_bits < self.settings.max_window_bits as i8 {
-                                            self.com = Compressor::new(window_bits);
+                                            self.com = Compressor::new(window_bits, self.settings.compression_level as i32);
                                             res_ext.push_str("; ");
                                             res_ext.push_str(param)
                                         }
@@ -382,7 +386,7 @@ impl<H: Handler> Handler for DeflateHandler<H> {
                                 if let Ok(window_bits) = window_bits_str.trim().parse() {
                                     if window_bits >= 9 && window_bits <= 15 {
                                         if window_bits as u8 != self.settings.max_window_bits {
-                                            self.com = Compressor::new(window_bits);
+                                            self.com = Compressor::new(window_bits, self.settings.compression_level as i32);
                                         }
                                     } else {
                                         return Err(Error::new(
