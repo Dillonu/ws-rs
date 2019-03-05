@@ -1,15 +1,17 @@
 use std::io;
 use std::io::ErrorKind::WouldBlock;
-use std::net::SocketAddr;
-#[cfg(feature = "ssl")]
+#[cfg(any(feature = "ssl", feature = "nativetls"))]
 use std::mem::replace;
+use std::net::SocketAddr;
 
-use mio::tcp::TcpStream;
-#[cfg(feature = "ssl")]
-use openssl::ssl::{HandshakeError, MidHandshakeSslStream, SslStream};
-#[cfg(feature = "ssl")]
-use openssl::ssl::Error as SslError;
 use bytes::{Buf, BufMut};
+use mio::tcp::TcpStream;
+#[cfg(feature = "nativetls")]
+use native_tls::{
+    HandshakeError, MidHandshakeTlsStream as MidHandshakeSslStream, TlsStream as SslStream,
+};
+#[cfg(feature = "ssl")]
+use openssl::ssl::{ErrorCode as SslErrorCode, HandshakeError, MidHandshakeSslStream, SslStream};
 
 use result::{Error, Kind, Result};
 
@@ -69,7 +71,7 @@ impl<T: io::Write> TryWriteBuf for T {}
 use self::Stream::*;
 pub enum Stream {
     Tcp(TcpStream),
-    #[cfg(feature = "ssl")]
+    #[cfg(any(feature = "ssl", feature = "nativetls"))]
     Tls(TlsStream),
 }
 
@@ -78,7 +80,7 @@ impl Stream {
         Tcp(stream)
     }
 
-    #[cfg(feature = "ssl")]
+    #[cfg(any(feature = "ssl", feature = "nativetls"))]
     pub fn tls(stream: MidHandshakeSslStream<TcpStream>) -> Stream {
         Tls(TlsStream::Handshake {
             sock: stream,
@@ -86,12 +88,12 @@ impl Stream {
         })
     }
 
-    #[cfg(feature = "ssl")]
+    #[cfg(any(feature = "ssl", feature = "nativetls"))]
     pub fn tls_live(stream: SslStream<TcpStream>) -> Stream {
         Tls(TlsStream::Live(stream))
     }
 
-    #[cfg(feature = "ssl")]
+    #[cfg(any(feature = "ssl", feature = "nativetls"))]
     pub fn is_tls(&self) -> bool {
         match *self {
             Tcp(_) => false,
@@ -102,7 +104,7 @@ impl Stream {
     pub fn evented(&self) -> &TcpStream {
         match *self {
             Tcp(ref sock) => sock,
-            #[cfg(feature = "ssl")]
+            #[cfg(any(feature = "ssl", feature = "nativetls"))]
             Tls(ref inner) => inner.evented(),
         }
     }
@@ -110,7 +112,7 @@ impl Stream {
     pub fn is_negotiating(&self) -> bool {
         match *self {
             Tcp(_) => false,
-            #[cfg(feature = "ssl")]
+            #[cfg(any(feature = "ssl", feature = "nativetls"))]
             Tls(ref inner) => inner.is_negotiating(),
         }
     }
@@ -121,7 +123,7 @@ impl Stream {
                 Kind::Internal,
                 "Attempted to clear negotiating flag on non ssl connection.",
             )),
-            #[cfg(feature = "ssl")]
+            #[cfg(any(feature = "ssl", feature = "nativetls"))]
             Tls(ref mut inner) => inner.clear_negotiating(),
         }
     }
@@ -129,7 +131,7 @@ impl Stream {
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
         match *self {
             Tcp(ref sock) => sock.peer_addr(),
-            #[cfg(feature = "ssl")]
+            #[cfg(any(feature = "ssl", feature = "nativetls"))]
             Tls(ref inner) => inner.peer_addr(),
         }
     }
@@ -137,7 +139,7 @@ impl Stream {
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         match *self {
             Tcp(ref sock) => sock.local_addr(),
-            #[cfg(feature = "ssl")]
+            #[cfg(any(feature = "ssl", feature = "nativetls"))]
             Tls(ref inner) => inner.local_addr(),
         }
     }
@@ -147,9 +149,9 @@ impl io::Read for Stream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match *self {
             Tcp(ref mut sock) => sock.read(buf),
-            #[cfg(feature = "ssl")]
+            #[cfg(any(feature = "ssl", feature = "nativetls"))]
             Tls(TlsStream::Live(ref mut sock)) => sock.read(buf),
-            #[cfg(feature = "ssl")]
+            #[cfg(any(feature = "ssl", feature = "nativetls"))]
             Tls(ref mut tls_stream) => {
                 trace!("Attempting to read ssl handshake.");
                 match replace(tls_stream, TlsStream::Upgrading) {
@@ -164,33 +166,45 @@ impl io::Read for Stream {
                             *tls_stream = TlsStream::Live(sock);
                             res
                         }
+                        #[cfg(feature = "ssl")]
                         Err(HandshakeError::SetupFailure(err)) => {
                             Err(io::Error::new(io::ErrorKind::Other, err))
                         }
+                        #[cfg(feature = "ssl")]
                         Err(HandshakeError::Failure(mid))
-                        | Err(HandshakeError::Interrupted(mid)) => {
-                            let err = match *mid.error() {
-                                SslError::WantWrite(_) => {
-                                    negotiating = true;
-                                    Err(io::Error::new(
-                                        io::ErrorKind::WouldBlock,
-                                        "SSL wants writing",
-                                    ))
-                                }
-                                SslError::WantRead(_) => Err(io::Error::new(
-                                    io::ErrorKind::WouldBlock,
-                                    "SSL wants reading",
-                                )),
-                                SslError::Stream(ref e) => Err(From::from(e.kind())),
-                                ref err => {
-                                    Err(io::Error::new(io::ErrorKind::Other, format!("{}", err)))
-                                }
+                        | Err(HandshakeError::WouldBlock(mid)) => {
+                            if mid.error().code() == SslErrorCode::WANT_READ {
+                                negotiating = true;
+                            }
+                            let err = if let Some(io_error) = mid.error().io_error() {
+                                Err(io::Error::new(
+                                    io_error.kind(),
+                                    format!("{:?}", io_error.get_ref()),
+                                ))
+                            } else {
+                                Err(io::Error::new(
+                                    io::ErrorKind::Other,
+                                    format!("{}", mid.error()),
+                                ))
                             };
+                            *tls_stream = TlsStream::Handshake {
+                                sock: mid,
+                                negotiating,
+                            };
+                            err
+                        }
+                        #[cfg(feature = "nativetls")]
+                        Err(HandshakeError::WouldBlock(mid)) => {
+                            negotiating = true;
                             *tls_stream = TlsStream::Handshake {
                                 sock: mid,
                                 negotiating: negotiating,
                             };
-                            err
+                            Err(io::Error::new(io::ErrorKind::WouldBlock, "SSL would block"))
+                        }
+                        #[cfg(feature = "nativetls")]
+                        Err(HandshakeError::Failure(err)) => {
+                            Err(io::Error::new(io::ErrorKind::Other, format!("{}", err)))
                         }
                     },
                 }
@@ -203,9 +217,9 @@ impl io::Write for Stream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match *self {
             Tcp(ref mut sock) => sock.write(buf),
-            #[cfg(feature = "ssl")]
+            #[cfg(any(feature = "ssl", feature = "nativetls"))]
             Tls(TlsStream::Live(ref mut sock)) => sock.write(buf),
-            #[cfg(feature = "ssl")]
+            #[cfg(any(feature = "ssl", feature = "nativetls"))]
             Tls(ref mut tls_stream) => {
                 trace!("Attempting to write ssl handshake.");
                 match replace(tls_stream, TlsStream::Upgrading) {
@@ -213,47 +227,56 @@ impl io::Write for Stream {
                     TlsStream::Handshake {
                         sock,
                         mut negotiating,
-                    } => {
-                        negotiating = false;
-
-                        match sock.handshake() {
-                            Ok(mut sock) => {
-                                trace!("Completed SSL Handshake");
-                                let res = sock.write(buf);
-                                *tls_stream = TlsStream::Live(sock);
-                                res
-                            }
-                            Err(HandshakeError::SetupFailure(err)) => {
-                                Err(io::Error::new(io::ErrorKind::Other, err))
-                            }
-                            Err(HandshakeError::Failure(mid))
-                            | Err(HandshakeError::Interrupted(mid)) => {
-                                let err = match *mid.error() {
-                                    SslError::WantRead(_) => {
-                                        negotiating = true;
-                                        Err(io::Error::new(
-                                            io::ErrorKind::WouldBlock,
-                                            "SSL wants reading",
-                                        ))
-                                    }
-                                    SslError::WantWrite(_) => Err(io::Error::new(
-                                        io::ErrorKind::WouldBlock,
-                                        "SSL wants writing",
-                                    )),
-                                    SslError::Stream(ref e) => Err(From::from(e.kind())),
-                                    ref err => Err(io::Error::new(
-                                        io::ErrorKind::Other,
-                                        format!("{}", err),
-                                    )),
-                                };
-                                *tls_stream = TlsStream::Handshake {
-                                    sock: mid,
-                                    negotiating: negotiating,
-                                };
-                                err
-                            }
+                    } => match sock.handshake() {
+                        Ok(mut sock) => {
+                            trace!("Completed SSL Handshake");
+                            let res = sock.write(buf);
+                            *tls_stream = TlsStream::Live(sock);
+                            res
                         }
-                    }
+                        #[cfg(feature = "ssl")]
+                        Err(HandshakeError::SetupFailure(err)) => {
+                            Err(io::Error::new(io::ErrorKind::Other, err))
+                        }
+                        #[cfg(feature = "ssl")]
+                        Err(HandshakeError::Failure(mid))
+                        | Err(HandshakeError::WouldBlock(mid)) => {
+                            if mid.error().code() == SslErrorCode::WANT_READ {
+                                negotiating = true;
+                            } else {
+                                negotiating = false;
+                            }
+                            let err = if let Some(io_error) = mid.error().io_error() {
+                                Err(io::Error::new(
+                                    io_error.kind(),
+                                    format!("{:?}", io_error.get_ref()),
+                                ))
+                            } else {
+                                Err(io::Error::new(
+                                    io::ErrorKind::Other,
+                                    format!("{}", mid.error()),
+                                ))
+                            };
+                            *tls_stream = TlsStream::Handshake {
+                                sock: mid,
+                                negotiating,
+                            };
+                            err
+                        }
+                        #[cfg(feature = "nativetls")]
+                        Err(HandshakeError::WouldBlock(mid)) => {
+                            negotiating = true;
+                            *tls_stream = TlsStream::Handshake {
+                                sock: mid,
+                                negotiating: negotiating,
+                            };
+                            Err(io::Error::new(io::ErrorKind::WouldBlock, "SSL would block"))
+                        }
+                        #[cfg(feature = "nativetls")]
+                        Err(HandshakeError::Failure(err)) => {
+                            Err(io::Error::new(io::ErrorKind::Other, format!("{}", err)))
+                        }
+                    },
                 }
             }
         }
@@ -262,17 +285,17 @@ impl io::Write for Stream {
     fn flush(&mut self) -> io::Result<()> {
         match *self {
             Tcp(ref mut sock) => sock.flush(),
-            #[cfg(feature = "ssl")]
+            #[cfg(any(feature = "ssl", feature = "nativetls"))]
             Tls(TlsStream::Live(ref mut sock)) => sock.flush(),
-            #[cfg(feature = "ssl")]
+            #[cfg(any(feature = "ssl", feature = "nativetls"))]
             Tls(TlsStream::Handshake { ref mut sock, .. }) => sock.get_mut().flush(),
-            #[cfg(feature = "ssl")]
+            #[cfg(any(feature = "ssl", feature = "nativetls"))]
             Tls(TlsStream::Upgrading) => panic!("Tried to access actively upgrading TlsStream"),
         }
     }
 }
 
-#[cfg(feature = "ssl")]
+#[cfg(any(feature = "ssl", feature = "nativetls"))]
 pub enum TlsStream {
     Live(SslStream<TcpStream>),
     Handshake {
@@ -282,7 +305,7 @@ pub enum TlsStream {
     Upgrading,
 }
 
-#[cfg(feature = "ssl")]
+#[cfg(any(feature = "ssl", feature = "nativetls"))]
 impl TlsStream {
     pub fn evented(&self) -> &TcpStream {
         match *self {

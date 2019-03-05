@@ -1,12 +1,12 @@
+use std::default::Default;
 use std::fmt;
 use std::io::{Cursor, ErrorKind, Read, Write};
-use std::default::Default;
 
-use rand;
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
+use rand;
 
-use result::{Error, Kind, Result};
 use protocol::{CloseCode, OpCode};
+use result::{Error, Kind, Result};
 use stream::TryReadBuf;
 
 fn apply_mask(buf: &mut [u8], mask: &[u8; 4]) {
@@ -244,7 +244,7 @@ impl Frame {
     }
 
     /// Parse the input stream into a frame.
-    pub fn parse(cursor: &mut Cursor<Vec<u8>>) -> Result<Option<Frame>> {
+    pub fn parse(cursor: &mut Cursor<Vec<u8>>, max_payload_length: u64) -> Result<Option<Frame>> {
         let size = cursor.get_ref().len() as u64 - cursor.position();
         let initial = cursor.position();
         trace!("Position in buffer {}", initial);
@@ -298,6 +298,16 @@ impl Frame {
             header_length += length_nbytes as u64;
         }
         trace!("Payload length: {}", length);
+
+        if length > max_payload_length {
+            return Err(Error::new(
+                Kind::Protocol,
+                format!(
+                    "Rejected frame with payload length exceeding defined max: {}.",
+                    max_payload_length
+                ),
+            ));
+        }
 
         let mask = if masked {
             let mut mask_bytes = [0u8; 4];

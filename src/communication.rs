@@ -1,16 +1,17 @@
-use std::convert::Into;
 use std::borrow::Cow;
+use std::convert::Into;
 
-use url;
 use mio;
 use mio::Token;
 use mio_extras::timer::Timeout;
+use url;
 
-use message;
-use result::{Error, Result};
-use protocol::CloseCode;
-use std::cmp::PartialEq;
 use io::ALL;
+use message;
+use protocol::CloseCode;
+use result::{Error, Result};
+use std::cmp::PartialEq;
+use std::fmt;
 
 #[derive(Debug, Clone)]
 pub enum Signal {
@@ -52,6 +53,14 @@ pub struct Sender {
     token: Token,
     channel: mio::channel::SyncSender<Command>,
     connection_id: u32,
+}
+
+impl fmt::Debug for Sender {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f,
+            "Sender {{ token: {:?}, channel: mio::channel::SyncSender<Command>, connection_id: {:?} }}",
+            self.token, self.connection_id)
+    }
 }
 
 impl PartialEq for Sender {

@@ -1,28 +1,30 @@
-use std::mem::replace;
 use std::borrow::Borrow;
-use std::io::{Cursor, Read, Seek, SeekFrom, Write};
-use std::net::SocketAddr;
 use std::collections::VecDeque;
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
+use std::mem::replace;
+use std::net::SocketAddr;
 use std::str::from_utf8;
 
-use url;
+use mio::tcp::TcpStream;
 use mio::{Ready, Token};
 use mio_extras::timer::Timeout;
-use mio::tcp::TcpStream;
+use url;
 
+#[cfg(feature = "nativetls")]
+use native_tls::HandshakeError;
 #[cfg(feature = "ssl")]
 use openssl::ssl::HandshakeError;
 
-use message::Message;
-use handshake::{Handshake, Request, Response};
 use frame::Frame;
+use handler::Handler;
+use handshake::{Handshake, Request, Response};
+use message::Message;
 use protocol::{CloseCode, OpCode};
 use result::{Error, Kind, Result};
-use handler::Handler;
 use stream::{Stream, TryReadBuf, TryWriteBuf};
 
-use self::State::*;
 use self::Endpoint::*;
+use self::State::*;
 
 use super::Settings;
 
@@ -146,7 +148,7 @@ where
         }
     }
 
-    #[cfg(feature = "ssl")]
+    #[cfg(any(feature = "ssl", feature = "nativetls"))]
     pub fn encrypt(&mut self) -> Result<()> {
         let sock = self.socket().try_clone()?;
         let ssl_stream = match self.endpoint {
@@ -159,6 +161,7 @@ where
                 self.socket = Stream::tls_live(stream);
                 Ok(())
             }
+            #[cfg(feature = "ssl")]
             Err(Error {
                 kind: Kind::SslHandshake(handshake_err),
                 details,
@@ -166,7 +169,20 @@ where
                 HandshakeError::SetupFailure(_) => {
                     Err(Error::new(Kind::SslHandshake(handshake_err), details))
                 }
-                HandshakeError::Failure(mid) | HandshakeError::Interrupted(mid) => {
+                HandshakeError::Failure(mid) | HandshakeError::WouldBlock(mid) => {
+                    self.socket = Stream::tls(mid);
+                    Ok(())
+                }
+            },
+            #[cfg(feature = "nativetls")]
+            Err(Error {
+                kind: Kind::SslHandshake(handshake_err),
+                details,
+            }) => match handshake_err {
+                HandshakeError::Failure(_) => {
+                    Err(Error::new(Kind::SslHandshake(handshake_err), details))
+                }
+                HandshakeError::WouldBlock(mid) => {
                     self.socket = Stream::tls(mid);
                     Ok(())
                 }
@@ -196,7 +212,7 @@ where
     }
 
     // Resetting may be necessary in order to try all possible addresses for a server
-    #[cfg(feature = "ssl")]
+    #[cfg(any(feature = "ssl", feature = "nativetls"))]
     pub fn reset(&mut self) -> Result<()> {
         // if self.is_client() {
         if let Client(ref url) = self.endpoint {
@@ -215,6 +231,7 @@ where
                                 self.socket = Stream::tls_live(stream);
                                 Ok(())
                             }
+                            #[cfg(feature = "ssl")]
                             Err(Error {
                                 kind: Kind::SslHandshake(handshake_err),
                                 details,
@@ -222,7 +239,20 @@ where
                                 HandshakeError::SetupFailure(_) => {
                                     Err(Error::new(Kind::SslHandshake(handshake_err), details))
                                 }
-                                HandshakeError::Failure(mid) | HandshakeError::Interrupted(mid) => {
+                                HandshakeError::Failure(mid) | HandshakeError::WouldBlock(mid) => {
+                                    self.socket = Stream::tls(mid);
+                                    Ok(())
+                                }
+                            },
+                            #[cfg(feature = "nativetls")]
+                            Err(Error {
+                                kind: Kind::SslHandshake(handshake_err),
+                                details,
+                            }) => match handshake_err {
+                                HandshakeError::Failure(_) => {
+                                    Err(Error::new(Kind::SslHandshake(handshake_err), details))
+                                }
+                                HandshakeError::WouldBlock(mid) => {
                                     self.socket = Stream::tls(mid);
                                     Ok(())
                                 }
@@ -253,7 +283,7 @@ where
         }
     }
 
-    #[cfg(not(feature = "ssl"))]
+    #[cfg(not(any(feature = "ssl", feature = "nativetls")))]
     pub fn reset(&mut self) -> Result<()> {
         if self.is_client() {
             if let Connecting(ref mut req, ref mut res) = self.state {
@@ -548,7 +578,11 @@ where
         if let Connecting(ref mut req, ref mut res) = self.state {
             match self.endpoint {
                 Server => {
-                    if self.socket.try_read_buf(req.get_mut())?.is_some() {
+                    if let Some(read) = self.socket.try_read_buf(req.get_mut())? {
+                        if read == 0 {
+                            self.events = Ready::empty();
+                            return Ok(());
+                        }
                         if let Some(ref request) = Request::parse(req.get_ref())? {
                             trace!("Handshake request received: \n{}", request);
                             let response = self.handler.on_request(request)?;
@@ -575,6 +609,9 @@ where
                             end
                         };
                         res.get_mut().truncate(end);
+                    } else {
+                        // NOTE: wait to be polled again; response not ready.
+                        return Ok(());
                     }
                 }
             }
@@ -680,7 +717,8 @@ where
     }
 
     fn read_frames(&mut self) -> Result<()> {
-        while let Some(mut frame) = Frame::parse(&mut self.in_buffer)? {
+        let max_size = self.settings.max_fragment_size as u64;
+        while let Some(mut frame) = Frame::parse(&mut self.in_buffer, max_size)? {
             match self.state {
                 // Ignore data received after receiving close frame
                 RespondingClose | FinishedClose => continue,

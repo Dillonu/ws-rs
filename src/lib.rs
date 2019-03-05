@@ -10,6 +10,8 @@ extern crate mio;
 extern crate mio_extras;
 #[cfg(feature = "ssl")]
 extern crate openssl;
+#[cfg(feature = "nativetls")]
+extern crate native_tls;
 extern crate rand;
 extern crate sha1;
 extern crate slab;
@@ -17,16 +19,16 @@ extern crate url;
 #[macro_use]
 extern crate log;
 
-mod result;
+mod communication;
 mod connection;
-mod handler;
 mod factory;
 mod frame;
-mod message;
+mod handler;
 mod handshake;
-mod protocol;
-mod communication;
 mod io;
+mod message;
+mod protocol;
+mod result;
 mod stream;
 
 #[cfg(feature = "permessage-deflate")]
@@ -37,18 +39,18 @@ pub mod util;
 pub use factory::Factory;
 pub use handler::Handler;
 
-pub use result::{Error, Result};
-pub use result::Kind as ErrorKind;
-pub use message::Message;
 pub use communication::Sender;
 pub use frame::Frame;
-pub use protocol::{CloseCode, OpCode};
 pub use handshake::{Handshake, Request, Response};
+pub use message::Message;
+pub use protocol::{CloseCode, OpCode};
+pub use result::Kind as ErrorKind;
+pub use result::{Error, Result};
 
-use std::fmt;
-use std::default::Default;
-use std::net::{SocketAddr, ToSocketAddrs};
 use std::borrow::Borrow;
+use std::default::Default;
+use std::fmt;
+use std::net::{SocketAddr, ToSocketAddrs};
 
 use mio::Poll;
 
@@ -156,6 +158,9 @@ pub struct Settings {
     /// The maximum length of outgoing frames. Messages longer than this will be fragmented.
     /// Default: 65,535
     pub fragment_size: usize,
+    /// The maximum length of acceptable incoming frames. Messages longer than this will be rejected.
+    /// Default: unlimited
+    pub max_fragment_size: usize,
     /// The size of the incoming buffer. A larger buffer uses more memory but will allow for fewer
     /// reallocations.
     /// Default: 2048
@@ -243,6 +248,7 @@ impl Default for Settings {
             fragments_capacity: 10,
             fragments_grow: true,
             fragment_size: u16::max_value() as usize,
+            max_fragment_size: usize::max_value(),
             in_buffer_capacity: 2048,
             in_buffer_grow: true,
             out_buffer_capacity: 2048,

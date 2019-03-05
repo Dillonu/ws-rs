@@ -1,12 +1,12 @@
 use std::fmt;
 use std::io::Write;
-use std::str::from_utf8;
 use std::net::SocketAddr;
+use std::str::from_utf8;
 
-use sha1;
-use rand;
-use url;
 use httparse;
+use rand;
+use sha1;
+use url;
 
 use result::{Error, Kind, Result};
 
@@ -351,26 +351,33 @@ impl Request {
             "".into()
         };
 
+        let mut headers = vec![
+            ("Connection".into(), "Upgrade".into()),
+            (
+                "Host".into(),
+                format!(
+                    "{}:{}",
+                    url.host_str().ok_or_else(|| Error::new(
+                        Kind::Internal,
+                        "No host passed for WebSocket connection.",
+                    ))?,
+                    url.port_or_known_default().unwrap_or(80)
+                ).into(),
+            ),
+            ("Sec-WebSocket-Version".into(), "13".into()),
+            ("Sec-WebSocket-Key".into(), generate_key().into()),
+            ("Upgrade".into(), "websocket".into()),
+        ];
+
+        if url.password().is_some() || url.username() != "" {
+            let basic = encode_base64(format!("{}:{}", url.username(), url.password().unwrap_or("")).as_bytes());
+            headers.push(("Authorization".into(), format!("Basic {}", basic).into()))
+        }
+
         let req = Request {
             path: format!("{}{}", url.path(), query),
             method: "GET".to_owned(),
-            headers: vec![
-                ("Connection".into(), "Upgrade".into()),
-                (
-                    "Host".into(),
-                    format!(
-                        "{}:{}",
-                        url.host_str().ok_or_else(|| Error::new(
-                            Kind::Internal,
-                            "No host passed for WebSocket connection.",
-                        ))?,
-                        url.port_or_known_default().unwrap_or(80)
-                    ).into(),
-                ),
-                ("Sec-WebSocket-Version".into(), "13".into()),
-                ("Sec-WebSocket-Key".into(), generate_key().into()),
-                ("Upgrade".into(), "websocket".into()),
-            ],
+            headers: headers,
         };
 
         debug!("Built request from URL:\n{}", req);
@@ -656,10 +663,10 @@ impl fmt::Display for Response {
 
 mod test {
     #![allow(unused_imports, unused_variables, dead_code)]
+    use super::*;
     use std::io::Write;
     use std::net::SocketAddr;
     use std::str::FromStr;
-    use super::*;
 
     #[test]
     fn remote_addr() {
